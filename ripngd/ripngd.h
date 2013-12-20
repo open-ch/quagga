@@ -129,6 +129,10 @@ struct ripng
   struct thread *t_triggered_update;
   struct thread *t_triggered_interval;
 
+  /* RIPng default distance. */
+  u_char distance;
+  struct route_table *distance_table;
+
   /* For redistribute route map. */
   struct
   {
@@ -200,6 +204,9 @@ struct ripng_info
   u_short tag_out;
 
   struct route_node *rp;
+
+  /* Route's administrative distance. */
+  u_char distance;
 };
 
 #ifdef notyet
@@ -376,12 +383,14 @@ extern int ripng_offset_list_apply_out (struct prefix_ipv6 *,
                                         struct interface *, u_char *);
 extern void ripng_offset_clean (void);
 
+extern u_char ripng_distance_apply (struct ripng_info *);
+
 extern struct ripng_info * ripng_info_new (void);
 extern void ripng_info_free (struct ripng_info *rinfo);
 extern void ripng_event (enum ripng_event, int);
 extern int ripng_request (struct interface *ifp);
 extern void ripng_redistribute_add (int, int, struct prefix_ipv6 *,
-                                    unsigned int, struct in6_addr *);
+                                    unsigned int, struct in6_addr *, u_char);
 extern void ripng_redistribute_delete (int, int, struct prefix_ipv6 *,
                                        unsigned int);
 extern void ripng_redistribute_withdraw (int type);
@@ -391,7 +400,7 @@ extern void ripng_if_rmap_update_interface (struct interface *);
 
 extern void ripng_zebra_ipv6_add (struct prefix_ipv6 *p,
                                   struct in6_addr *nexthop,
-                                  unsigned int ifindex, u_char metric);
+                                  unsigned int ifindex, u_char metric, u_char distance);
 extern void ripng_zebra_ipv6_delete (struct prefix_ipv6 *p,
                                      struct in6_addr *nexthop,
                                      unsigned int ifindex);
