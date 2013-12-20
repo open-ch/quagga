@@ -628,11 +628,13 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
   int ret;
   struct prefix_ipv6 p;
   struct route_node *rp;
-  struct ripng_info *rinfo;
+  struct ripng_info *rinfo, rinfotmp;
   struct ripng_interface *ri;
   struct in6_addr *nexthop;
   u_char oldmetric;
   int same = 0;
+  int route_reuse = 0;
+  unsigned char old_dist, new_dist;
 
   /* Make prefix structure. */
   memset (&p, 0, sizeof (struct prefix_ipv6));
@@ -738,7 +740,40 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
       /* Redistributed route check. */
       if (rinfo->type != ZEBRA_ROUTE_RIPNG
 	  && rinfo->metric != RIPNG_METRIC_INFINITY)
-	return;
+        {
+          /* Fill in a minimaly temporary ripng_info structure, for a future
+             ripng_distance_apply() use. */
+          memset (&rinfotmp, 0, sizeof (rinfotmp));
+          IPV6_ADDR_COPY (&rinfotmp.from, &from->sin6_addr);
+          rinfotmp.rp = rinfo->rp;
+          new_dist = ripng_distance_apply (&rinfotmp);
+          new_dist = new_dist ? new_dist : ZEBRA_RIPNG_DISTANCE_DEFAULT;
+          old_dist = rinfo->distance;
+          /* Only connected routes may have a valid NULL distance */
+          if (rinfo->type != ZEBRA_ROUTE_CONNECT)
+            old_dist = old_dist ? old_dist : ZEBRA_RIPNG_DISTANCE_DEFAULT;
+          /* If imported route does not have STRICT precedence,
+             mark it as a ghost. */
+          if (new_dist > old_dist
+              || rte->metric == RIPNG_METRIC_INFINITY)
+            {
+              route_unlock_node (rp);
+              return;
+            }
+          else
+            {
+              RIPNG_TIMER_OFF (rinfo->t_timeout);
+              RIPNG_TIMER_OFF (rinfo->t_garbage_collect);
+
+              rp->info = NULL;
+              if (ripng_route_rte (rinfo))
+                ripng_zebra_ipv6_delete ((struct prefix_ipv6 *)&rp->p,
+                    &rinfo->nexthop, rinfo->metric);
+              ripng_info_free (rinfo);
+              rinfo = NULL;
+              route_reuse = 1;
+            }
+        }
 
       /* Local static route. */
       if (rinfo->type == ZEBRA_ROUTE_RIPNG
@@ -791,8 +826,11 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
 	  rinfo->type = ZEBRA_ROUTE_RIPNG;
 	  rinfo->sub_type = RIPNG_ROUTE_RTE;
 
+          /* Set distance value. */
+          rinfo->distance = ripng_distance_apply(rinfo);
+
 	  ripng_zebra_ipv6_add (&p, &rinfo->nexthop, rinfo->ifindex,
-				rinfo->metric);
+				rinfo->metric, rinfo->distance);
 	  rinfo->flags |= RIPNG_RTF_FIB;
 
 	  /* Aggregate check. */
@@ -813,12 +851,23 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
       if (same)
 	ripng_timeout_update (rinfo);
 
+      /* Fill in a minimaly temporary ripng_info structure, for a future
+         ripng_distance_apply() use */
+      memset (&rinfotmp, 0, sizeof (rinfotmp));
+      IPV6_ADDR_COPY (&rinfotmp.from, &from->sin6_addr);
+      rinfotmp.rp = rinfo->rp;
+
       /* Next, compare the metrics.  If the datagram is from the same
 	 router as the existing route, and the new metric is different
 	 than the old one; or, if the new metric is lower than the old
 	 one; do the following actions: */
       if ((same && rinfo->metric != rte->metric) ||
-	  rte->metric < rinfo->metric)
+	  (rte->metric < rinfo->metric) ||
+              ((same)
+                  && (rinfo->metric == rte->metric)
+                  && ntohs (rte->tag) != rinfo->tag) ||
+              (rinfo->distance > ripng_distance_apply (&rinfotmp)) ||
+              ((rinfo->distance != ripng_distance_apply (rinfo)) && same))
 	{
 	  /* - Adopt the route from the datagram.  That is, put the
 	     new metric in, and adjust the next hop address (if
@@ -828,6 +877,7 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
 	  rinfo->tag = ntohs (rte->tag);
 	  IPV6_ADDR_COPY (&rinfo->from, &from->sin6_addr);
 	  rinfo->ifindex = ifp->ifindex;
+	  rinfo->distance = ripng_distance_apply(rinfo);
 
 	  /* Should a new route to this network be established
 	     while the garbage-collection timer is running, the
@@ -846,7 +896,7 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
 	      if (! IPV6_ADDR_SAME (&rinfo->nexthop, nexthop))
 		IPV6_ADDR_COPY (&rinfo->nexthop, nexthop);
 
-	      ripng_zebra_ipv6_add (&p, nexthop, ifp->ifindex, rinfo->metric);
+	      ripng_zebra_ipv6_add (&p, nexthop, ifp->ifindex, rinfo->metric, rinfo->distance);
 	      rinfo->flags |= RIPNG_RTF_FIB;
 
 	      /* The aggregation counter needs to be updated because
@@ -859,7 +909,7 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
 	  if (oldmetric != RIPNG_METRIC_INFINITY)
 	    {
 	      ripng_zebra_ipv6_delete (&p, &rinfo->nexthop, rinfo->ifindex);
-	      ripng_zebra_ipv6_add (&p, nexthop, ifp->ifindex, rinfo->metric);
+	      ripng_zebra_ipv6_add (&p, nexthop, ifp->ifindex, rinfo->metric, rinfo->distance);
 	      rinfo->flags |= RIPNG_RTF_FIB;
 
 	      if (! IPV6_ADDR_SAME (&rinfo->nexthop, nexthop))
@@ -918,7 +968,7 @@ ripng_route_process (struct rte *rte, struct sockaddr_in6 *from,
 /* Add redistributed route to RIPng table. */
 void
 ripng_redistribute_add (int type, int sub_type, struct prefix_ipv6 *p, 
-			unsigned int ifindex, struct in6_addr *nexthop)
+			unsigned int ifindex, struct in6_addr *nexthop, unsigned char distance)
 {
   struct route_node *rp;
   struct ripng_info *rinfo;
@@ -987,6 +1037,7 @@ ripng_redistribute_add (int type, int sub_type, struct prefix_ipv6 *p,
   rinfo->ifindex = ifindex;
   rinfo->metric = 1;
   rinfo->rp = rp;
+  rinfo->distance = distance;
   
   if (nexthop && IN6_IS_ADDR_LINKLOCAL(nexthop))
     rinfo->nexthop = *nexthop;
@@ -2164,6 +2215,8 @@ DEFUN (show_ipv6_ripng_status,
   vty_out (vty, "    Gateway          BadPackets BadRoutes  Distance Last Update%s", VTY_NEWLINE);
   ripng_peer_display (vty);
 
+  ripng_distance_show (vty);
+
   return CMD_SUCCESS;  
 }
 
@@ -2231,7 +2284,7 @@ DEFUN (ripng_route,
     }
   rp->info = (void *)1;
 
-  ripng_redistribute_add (ZEBRA_ROUTE_RIPNG, RIPNG_ROUTE_STATIC, &p, 0, NULL);
+  ripng_redistribute_add (ZEBRA_ROUTE_RIPNG, RIPNG_ROUTE_STATIC, &p, 0, NULL, 0);
 
   return CMD_SUCCESS;
 }
@@ -2369,6 +2422,274 @@ ALIAS (no_ripng_default_metric,
        NO_STR
        "Set a metric of redistribute routes\n"
        "Default metric\n")
+
+struct route_table *ripng_distance_table;
+
+struct ripng_distance
+{
+  /* Distance value for the IP source prefix. */
+  u_char distance;
+
+  /* Name of the access-list to be matched */
+  char *access_list;
+};
+
+static struct ripng_distance *
+ripng_distance_new (void)
+{
+  return XCALLOC (MTYPE_RIPNG_DISTANCE, sizeof (struct ripng_distance));
+}
+
+static void
+ripng_distance_free (struct ripng_distance *rdistance)
+{
+  XFREE (MTYPE_RIPNG_DISTANCE, rdistance);
+}
+
+static int
+ripng_distance_set (struct vty *vty, const char *distance_str, const char *ip_str,
+                    const char *access_list_str)
+{
+  int ret;
+  struct prefix_ipv6 p;
+  u_char distance;
+  struct route_node *rn;
+  struct ripng_distance *rdistance;
+
+  ret = str2prefix_ipv6 (ip_str, &p);
+  if (ret == 0)
+    {
+      vty_out (vty, "Malformed prefix%s", VTY_NEWLINE);
+      return CMD_WARNING;
+    }
+
+  distance = atoi (distance_str);
+
+  /* Get RIPng distance node. */
+  rn = route_node_get (ripng_distance_table, (struct prefix *) &p);
+  if (rn->info)
+    {
+      rdistance = rn->info;
+      route_unlock_node (rn);
+    }
+  else
+    {
+      rdistance = ripng_distance_new ();
+      rn->info = rdistance;
+    }
+
+  /* Set distance value. */
+  rdistance->distance = distance;
+
+  /* Reset access-list configuration. */
+  if (rdistance->access_list)
+    {
+      free (rdistance->access_list);
+      rdistance->access_list = NULL;
+    }
+  if (access_list_str)
+    rdistance->access_list = strdup (access_list_str);
+
+  return CMD_SUCCESS;
+}
+
+static int
+ripng_distance_unset (struct vty *vty, const char *distance_str,
+                      const char *ip_str, const char *access_list_str)
+{
+  int ret;
+  struct prefix_ipv6 p;
+  u_char distance;
+  struct route_node *rn;
+  struct ripng_distance *rdistance;
+
+  ret = str2prefix_ipv6 (ip_str, &p);
+  if (ret == 0)
+    {
+      vty_out (vty, "Malformed prefix%s", VTY_NEWLINE);
+      return CMD_WARNING;
+    }
+
+  distance = atoi (distance_str);
+
+  rn = route_node_lookup (ripng_distance_table, (struct prefix *) &p);
+  if (! rn)
+    {
+      vty_out (vty, "Can't find specified prefix%s", VTY_NEWLINE);
+      return CMD_WARNING;
+    }
+
+  rdistance = rn->info;
+
+  if (rdistance->access_list)
+    free (rdistance->access_list);
+  ripng_distance_free (rdistance);
+
+  rn->info = NULL;
+  route_unlock_node (rn);
+  route_unlock_node (rn);
+
+  return CMD_SUCCESS;
+}
+
+static void
+ripng_distance_reset (void)
+{
+  struct route_node *rn;
+  struct ripng_distance *rdistance;
+
+  for (rn = route_top (ripng_distance_table); rn; rn = route_next (rn))
+    if ((rdistance = rn->info) != NULL)
+      {
+        if (rdistance->access_list)
+          free (rdistance->access_list);
+        ripng_distance_free (rdistance);
+        rn->info = NULL;
+        route_unlock_node (rn);
+      }
+}
+
+/* Apply RIP information to distance method. */
+u_char
+ripng_distance_apply (struct ripng_info *rinfo)
+{
+  struct route_node *rn;
+  struct prefix_ipv6 p;
+  struct ripng_distance *rdistance;
+  struct access_list *alist;
+
+  if (! ripng)
+    return 0;
+
+  memset (&p, 0, sizeof (struct prefix_ipv6));
+  p.family = AF_INET;
+  p.prefix = rinfo->from;
+  p.prefixlen = IPV6_MAX_BITLEN;
+
+  /* Check source address. */
+  rn = route_node_match (ripng_distance_table, (struct prefix *) &p);
+  if (rn)
+    {
+      rdistance = rn->info;
+      route_unlock_node (rn);
+
+      if (rdistance->access_list)
+        {
+          alist = access_list_lookup (AFI_IP, rdistance->access_list);
+          if (alist == NULL)
+            return 0;
+          if (access_list_apply (alist, &rinfo->rp->p) == FILTER_DENY)
+            return 0;
+
+          return rdistance->distance;
+        }
+      else
+        return rdistance->distance;
+    }
+
+  if (ripng->distance)
+    return ripng->distance;
+
+  return 0;
+}
+
+void
+ripng_distance_show (struct vty *vty)
+{
+  struct route_node *rn;
+  struct ripng_distance *rdistance;
+  int header = 1;
+  char buf[BUFSIZ];
+
+  vty_out (vty, "  Distance: (default is %d)%s",
+           ripng->distance ? ripng->distance :ZEBRA_RIPNG_DISTANCE_DEFAULT,
+           VTY_NEWLINE);
+
+  for (rn = route_top (ripng_distance_table); rn; rn = route_next (rn))
+    if ((rdistance = rn->info) != NULL)
+      {
+        if (header)
+          {
+            vty_out (vty, "    Address           Distance  List%s",
+                     VTY_NEWLINE);
+            header = 0;
+          }
+        sprintf (buf, "%s/%d", inet6_ntoa (rn->p.u.prefix6), rn->p.prefixlen);
+        vty_out (vty, "    %-20s  %4d  %s%s",
+                 buf, rdistance->distance,
+                 rdistance->access_list ? rdistance->access_list : "",
+                 VTY_NEWLINE);
+      }
+}
+
+DEFUN (ripng_distance,
+       ripng_distance_cmd,
+       "distance <1-255>",
+       "Administrative distance\n"
+       "Distance value\n")
+{
+  ripng->distance = atoi (argv[0]);
+  return CMD_SUCCESS;
+}
+
+DEFUN (no_ripng_distance,
+       no_ripng_distance_cmd,
+       "no distance <1-255>",
+       NO_STR
+       "Administrative distance\n"
+       "Distance value\n")
+{
+  ripng->distance = 0;
+  return CMD_SUCCESS;
+}
+
+DEFUN (ripng_distance_source,
+       ripng_distance_source_cmd,
+       "distance <1-255> X:X::X:X/M",
+       "Administrative distance\n"
+       "Distance value\n"
+       "IP source prefix\n")
+{
+  ripng_distance_set (vty, argv[0], argv[1], NULL);
+  return CMD_SUCCESS;
+}
+
+DEFUN (no_ripng_distance_source,
+       no_ripng_distance_source_cmd,
+       "no distance <1-255> X:X::X:X/M",
+       NO_STR
+       "Administrative distance\n"
+       "Distance value\n"
+       "IP source prefix\n")
+{
+  ripng_distance_unset (vty, argv[0], argv[1], NULL);
+  return CMD_SUCCESS;
+}
+
+DEFUN (ripng_distance_source_access_list,
+       ripng_distance_source_access_list_cmd,
+       "distance <1-255> X:X::X:X/M WORD",
+       "Administrative distance\n"
+       "Distance value\n"
+       "IP source prefix\n"
+       "Access list name\n")
+{
+  ripng_distance_set (vty, argv[0], argv[1], argv[2]);
+  return CMD_SUCCESS;
+}
+
+DEFUN (no_ripng_distance_source_access_list,
+       no_ripng_distance_source_access_list_cmd,
+       "no distance <1-255> X:X::X:X/M WORD",
+       NO_STR
+       "Administrative distance\n"
+       "Distance value\n"
+       "IP source prefix\n"
+       "Access list name\n")
+{
+  ripng_distance_unset (vty, argv[0], argv[1], argv[2]);
+  return CMD_SUCCESS;
+}
 
 #if 0
 /* RIPng update timer setup. */
@@ -2568,7 +2889,7 @@ DEFUN (ripng_default_information_originate,
     ripng->default_information = 1;
 
     str2prefix_ipv6 ("::/0", &p);
-    ripng_redistribute_add (ZEBRA_ROUTE_RIPNG, RIPNG_ROUTE_DEFAULT, &p, 0, NULL);
+    ripng_redistribute_add (ZEBRA_ROUTE_RIPNG, RIPNG_ROUTE_DEFAULT, &p, 0, NULL, 0);
   }
 
   return CMD_SUCCESS;
@@ -2601,6 +2922,7 @@ ripng_config_write (struct vty *vty)
   void ripng_redistribute_write (struct vty *, int);
   int write = 0;
   struct route_node *rp;
+  struct ripng_distance *rdistance;
 
   if (ripng)
     {
@@ -2650,6 +2972,19 @@ ripng_config_write (struct vty *vty)
 		   ripng->garbage_time,
 		   VTY_NEWLINE);
 	}
+
+      /* Distance configuration. */
+      if (ripng->distance)
+        vty_out (vty, " distance %d%s", ripng->distance, VTY_NEWLINE);
+
+      /* RIPng source IP prefix distance configuration. */
+      for (rp = route_top (ripng_distance_table); rp; rp = route_next (rp))
+        if ((rdistance = rp->info) != NULL)
+          vty_out (vty, " distance %d %s/%d %s%s", rdistance->distance,
+                   inet6_ntoa (rp->p.u.prefix6), rp->p.prefixlen,
+                   rdistance->access_list ? rdistance->access_list : "",
+                   VTY_NEWLINE);
+
 #if 0
       if (ripng->update_time != RIPNG_UPDATE_TIMER_DEFAULT)
 	vty_out (vty, " update-timer %d%s", ripng->update_time,
@@ -2843,6 +3178,7 @@ ripng_clean()
   ripng_offset_clean ();
   ripng_interface_clean ();
   ripng_redistribute_clean ();
+  ripng_distance_reset ();
 }
 
 /* Reset all values to the default settings. */
@@ -2863,6 +3199,8 @@ ripng_reset ()
   ripng_interface_reset ();
 
   ripng_zclient_reset ();
+
+  ripng_distance_reset();
 }
 
 static void
@@ -2984,6 +3322,13 @@ ripng_init ()
   install_element (RIPNG_NODE, &ripng_default_information_originate_cmd);
   install_element (RIPNG_NODE, &no_ripng_default_information_originate_cmd);
 
+  install_element (RIPNG_NODE, &ripng_distance_cmd);
+  install_element (RIPNG_NODE, &no_ripng_distance_source_cmd);
+  install_element (RIPNG_NODE, &ripng_distance_source_cmd);
+  install_element (RIPNG_NODE, &no_ripng_distance_cmd);
+  install_element (RIPNG_NODE, &ripng_distance_source_access_list_cmd);
+  install_element (RIPNG_NODE, &no_ripng_distance_source_access_list_cmd);
+
   ripng_if_init ();
   ripng_debug_init ();
 
@@ -3012,4 +3357,7 @@ ripng_init ()
   if_rmap_init (RIPNG_NODE);
   if_rmap_hook_add (ripng_if_rmap_update);
   if_rmap_hook_delete (ripng_if_rmap_update);
+
+  /* Distance control. */
+  ripng_distance_table = route_table_init ();
 }

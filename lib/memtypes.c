@@ -174,6 +174,7 @@ struct memory_list memory_list_ripng[] =
   { MTYPE_RIPNG_PEER,         "RIPng peer"			},
   { MTYPE_RIPNG_OFFSET_LIST,  "RIPng offset lst"		},
   { MTYPE_RIPNG_RTE_DATA,     "RIPng rte data"			},
+  { MTYPE_RIPNG_DISTANCE,     "RIPng distance"                  },
   { -1, NULL }
 };
 
