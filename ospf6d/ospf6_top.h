@@ -80,6 +80,14 @@ struct ospf6
   struct thread *t_spf_calc;	        /* SPF calculation timer. */
   struct thread *t_ase_calc;		/* ASE calculation timer. */
   struct thread *maxage_remover;
+
+  /* Distance parameters */
+  u_char distance_all;
+  u_char distance_intra;
+  u_char distance_inter;
+  u_char distance_external;
+
+  struct route_table *distance_table;
 };
 
 #define OSPF6_DISABLED    0x01
